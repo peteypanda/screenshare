@@ -1,189 +1,327 @@
-"use client"
+"use client";
 
-import { useState, useEffect, useRef } from "react"
-import { useSocket } from "@/hooks/useSocket"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import Peer from 'simple-peer'
+import React, { useState, useRef, useEffect } from 'react';
+import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { useSocket } from '@/hooks/useSocket';
+
+const screens = [
+  { id: 'pid1', name: 'PID 1' },
+  { id: 'pid2', name: 'PID 2' },
+  { id: 'pid3', name: 'PID 3' },
+  { id: 'pid4', name: 'PID 4' },
+  { id: 'outbound', name: 'Outbound Dock' },
+  { id: 'dockclerk', name: 'Dock Clerk' },
+];
 
 export default function ControlUI() {
-  const [selectedTVs, setSelectedTVs] = useState<string[]>([])
-  const [isScreensharing, setIsScreensharing] = useState(false)
-  const [stream, setStream] = useState<MediaStream | null>(null)
-  const socket = useSocket()
-  const [isClient, setIsClient] = useState(false)
-  const [screenShareSupported, setScreenShareSupported] = useState(false)
-  const [file, setFile] = useState<File | null>(null)
-  const peerRef = useRef<Peer.Instance | null>(null)
+  const [isSharing, setIsSharing] = useState(false);
+  const [selectedScreen, setSelectedScreen] = useState<string | null>(null);
+  const [isSelectingScreen, setIsSelectingScreen] = useState(false);
+  const [screenshot, setScreenshot] = useState<File | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const peerConnection = useRef<RTCPeerConnection | null>(null);
+  const socket = useSocket();
+
+  const addDebugMessage = (message: string) => {
+    console.log(message);
+    setDebugInfo(prev => [...prev, `${new Date().toISOString()}: ${message}`]);
+  };
 
   useEffect(() => {
-    setIsClient(true)
-    if (typeof window !== 'undefined') {
-      setScreenShareSupported(
-        !!navigator.mediaDevices &&
-        !!navigator.mediaDevices.getDisplayMedia
-      )
+    if (!socket) {
+      addDebugMessage('Waiting for socket connection...');
+      return;
     }
 
-    if (socket) {
-      socket.on('signal', (data) => {
-        if (peerRef.current) {
-          peerRef.current.signal(data)
+    const handleSignal = async (data: any) => {
+      if (!peerConnection.current) return;
+
+      try {
+        if (data.type === 'answer') {
+          addDebugMessage('Received answer');
+          await peerConnection.current.setRemoteDescription(new RTCSessionDescription(data.answer));
+        } else if (data.type === 'candidate' && data.candidate) {
+          addDebugMessage('Received ICE candidate');
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(data.candidate));
         }
-      })
-    }
+      } catch (error) {
+        console.error('Error handling signal:', error);
+        addDebugMessage(`Signal error: ${error}`);
+        setError('Failed to establish connection');
+      }
+    };
+
+    socket.on('signal', handleSignal);
 
     return () => {
-      if (socket) {
-        socket.off('signal')
+      socket.off('signal', handleSignal);
+      stopSharing();
+    };
+  }, [socket]);
+
+  const initializePeerConnection = () => {
+    addDebugMessage('Initializing peer connection');
+    
+    // Create new RTCPeerConnection with multiple STUN servers for better connectivity
+    peerConnection.current = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+      ],
+      iceCandidatePoolSize: 10
+    });
+
+    // Handle ICE candidates
+    peerConnection.current.onicecandidate = (event) => {
+      if (!socket || !selectedScreen) return;
+      
+      if (event.candidate) {
+        addDebugMessage('Sending ICE candidate');
+        socket.emit('signal', {
+          type: 'candidate',
+          candidate: event.candidate,
+          screenName: selectedScreen
+        });
       }
-    }
-  }, [socket])
+    };
 
-  const handleStartScreenshare = async () => {
-    if (screenShareSupported) {
-      try {
-        const mediaStream = await navigator.mediaDevices.getDisplayMedia({ video: true })
-        setStream(mediaStream)
-        setIsScreensharing(true)
-
-        const peer = new Peer({
-          initiator: true,
-          trickle: false,
-          stream: mediaStream,
-        })
-
-        peer.on('signal', (data) => {
-          socket?.emit('signal', { signal: data, tvs: selectedTVs })
-        })
-
-        peer.on('connect', () => {
-          console.log('Peer connection established')
-        })
-
-        peerRef.current = peer
-
-        console.log("Screen sharing started")
-      } catch (err) {
-        console.error("Error accessing screen:", err)
-        alert("Failed to start screen sharing. Please make sure you've granted the necessary permissions.")
+    // Handle connection state changes
+    peerConnection.current.onconnectionstatechange = () => {
+      const state = peerConnection.current?.connectionState;
+      addDebugMessage(`Connection state changed to: ${state}`);
+      
+      if (state === 'failed') {
+        setError('Connection failed. Attempting to reconnect...');
+        // Attempt to reconnect
+        setTimeout(() => {
+          if (isSharing) {
+            addDebugMessage('Attempting to reconnect...');
+            confirmSharing();
+          }
+        }, 2000);
       }
-    } else {
-      console.error("Screen sharing is not supported in this environment")
-      alert("Screen sharing is not supported in your current environment. Please ensure you're using a compatible browser and the application is running in a secure context (HTTPS or localhost).")
+    };
+
+    // Handle ICE connection state changes
+    peerConnection.current.oniceconnectionstatechange = () => {
+      const state = peerConnection.current?.iceConnectionState;
+      addDebugMessage(`ICE connection state: ${state}`);
+      
+      if (state === 'failed') {
+        peerConnection.current?.restartIce();
+      }
+    };
+  };
+
+  const startSharing = async () => {
+    setError(null);
+    setDebugInfo([]);
+    setIsSelectingScreen(true);
+  };
+
+  const confirmSharing = async () => {
+    if (!selectedScreen || !socket) {
+      setError('Please select a screen to share');
+      return;
     }
-  }
 
-  const handleStopScreenshare = () => {
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop())
+    addDebugMessage(`Starting share process for screen: ${selectedScreen}`);
+    socket.emit('join-room', selectedScreen);
+
+    try {
+      let stream: MediaStream;
+
+      if (screenshot) {
+        const img = new Image();
+        img.src = URL.createObjectURL(screenshot);
+        await new Promise((resolve) => (img.onload = resolve));
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0);
+        stream = canvas.captureStream();
+        addDebugMessage('Created stream from screenshot');
+      } else {
+        stream = await navigator.mediaDevices.getDisplayMedia({ 
+          video: { 
+            cursor: 'always',
+            displaySurface: 'monitor'
+          } 
+        });
+        addDebugMessage('Got display media stream');
+      }
+
+      streamRef.current = stream;
+
+      // Initialize peer connection
+      initializePeerConnection();
+
+      if (!peerConnection.current) {
+        throw new Error('Failed to initialize peer connection');
+      }
+
+      // Add tracks to the peer connection
+      stream.getTracks().forEach(track => {
+        if (peerConnection.current && streamRef.current) {
+          peerConnection.current.addTrack(track, streamRef.current);
+        }
+      });
+      addDebugMessage('Added tracks to peer connection');
+
+      // Create and send offer
+      const offer = await peerConnection.current.createOffer();
+      await peerConnection.current.setLocalDescription(offer);
+      addDebugMessage('Created and set local description');
+
+      socket.emit('signal', {
+        type: 'offer',
+        offer,
+        screenName: selectedScreen
+      });
+      addDebugMessage('Sent offer');
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+
+      setIsSharing(true);
+      setIsSelectingScreen(false);
+
+      // Handle stream end
+      stream.getVideoTracks()[0].onended = () => {
+        addDebugMessage('Stream ended by user');
+        stopSharing();
+      };
+    } catch (error) {
+      console.error('Error starting screen share:', error);
+      addDebugMessage(`Error: ${error}`);
+      setError('Failed to start screen sharing');
+      setIsSelectingScreen(false);
     }
-    if (peerRef.current) {
-      peerRef.current.destroy()
-      peerRef.current = null
-    }
-    setStream(null)
-    setIsScreensharing(false)
-    socket?.emit("stop-screenshare", { tvs: selectedTVs })
-  }
+  };
 
-  const handleUploadScreenshot = async () => {
-    if (!file) {
-      alert("Please select a file first.")
-      return
+  const stopSharing = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
 
-    const formData = new FormData()
-    formData.append("file", file)
-    formData.append("tvs", JSON.stringify(selectedTVs))
-
-    const response = await fetch("/api/upload", {
-      method: "POST",
-      body: formData,
-    })
-
-    if (response.ok) {
-      const data = await response.json()
-      console.log("Screenshot uploaded successfully")
-      socket?.emit("content-update", { type: "image", url: data.fileUrl, tvs: selectedTVs })
-      setFile(null)
-    } else {
-      console.error("Failed to upload screenshot")
-      alert("Failed to upload screenshot. Please try again.")
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
     }
-  }
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0])
+    if (peerConnection.current) {
+      peerConnection.current.close();
+      peerConnection.current = null;
     }
-  }
 
-  const toggleTV = (tv: string) => {
-    setSelectedTVs(prevTVs => 
-      prevTVs.includes(tv) 
-        ? prevTVs.filter(t => t !== tv) 
-        : [...prevTVs, tv]
-    )
-  }
+    if (socket && selectedScreen) {
+      socket.emit('stop-screenshare', { screenName: selectedScreen });
+      addDebugMessage('Sent stop-screenshare signal');
+    }
 
-  if (!isClient) {
-    return null // or a loading indicator
-  }
+    setIsSharing(false);
+    setSelectedScreen(null);
+    setScreenshot(null);
+    setError(null);
+  };
 
   return (
-    <div className="space-y-4 p-4">
-      <h1 className="text-2xl font-bold mb-4">TV Control System</h1>
-      
-      <div className="space-y-2">
-        <h2 className="text-lg font-semibold">Select TVs</h2>
-        <div className="flex space-x-2">
-          {["TV1", "TV2", "TV3", "TV4"].map((tv) => (
-            <Button 
-              key={tv} 
-              onClick={() => toggleTV(tv)}
-              variant={selectedTVs.includes(tv) ? "default" : "outline"}
-            >
-              {tv}
-            </Button>
-          ))}
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
+      <h1 className="text-2xl font-bold mb-6">Screen Sharing Control</h1>
+      {error && (
+        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
+          {error}
         </div>
-      </div>
-
-      <div className="space-y-2">
-        <h2 className="text-lg font-semibold">Screenshare Controls</h2>
-        <div className="flex space-x-2">
-          <Button 
-            onClick={handleStartScreenshare} 
-            disabled={isScreensharing || !screenShareSupported}
-          >
-            Start Screenshare
-          </Button>
-          <Button 
-            onClick={handleStopScreenshare} 
-            disabled={!isScreensharing}
-          >
-            Stop Screenshare
-          </Button>
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <h2 className="text-lg font-semibold">Upload Screenshot</h2>
-        <div className="flex space-x-2">
-          <Input type="file" onChange={handleFileChange} accept="image/*" />
-          <Button onClick={handleUploadScreenshot} disabled={!file}>
-            Upload
-          </Button>
-        </div>
-      </div>
-
-      {!screenShareSupported && (
-        <p className="text-red-500">
-          Screen sharing is not supported in your current environment. 
-          Please ensure you're using a compatible browser and the application is running in a secure context (HTTPS or localhost).
-        </p>
       )}
+      <div className="space-y-6 w-full max-w-md">
+        <div className="flex space-x-4">
+          <Button onClick={startSharing} disabled={isSharing} className="flex-1">
+            Start Sharing
+          </Button>
+          <Button onClick={stopSharing} disabled={!isSharing} variant="destructive" className="flex-1">
+            Stop Sharing
+          </Button>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="screenshot-upload">Upload Screenshot</Label>
+          <Input
+            id="screenshot-upload"
+            type="file"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) setScreenshot(file);
+            }}
+            accept="image/*"
+            disabled={isSharing}
+          />
+        </div>
+      </div>
+      <div className="mt-6 w-full max-w-2xl">
+        <video 
+          ref={videoRef} 
+          autoPlay 
+          playsInline 
+          muted 
+          className="w-full border border-gray-300 rounded-lg"
+        />
+      </div>
+      {isSharing && selectedScreen && (
+        <div className="mt-4 text-center">
+          <p className="text-green-600 font-semibold">
+            Currently sharing to: {screens.find((s) => s.id === selectedScreen)?.name}
+            {screenshot ? " (Screenshot)" : ""}
+          </p>
+          <p className="text-sm text-gray-600 mt-2">
+            Viewer URL: {`${window.location.origin}/viewer?screen=${selectedScreen}`}
+          </p>
+        </div>
+      )}
+
+      <Dialog open={isSelectingScreen} onOpenChange={setIsSelectingScreen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Select Screen to Share To</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <Select onValueChange={(value) => setSelectedScreen(value)}>
+              <SelectTrigger>
+                <SelectValue placeholder="Choose a screen" />
+              </SelectTrigger>
+              <SelectContent>
+                {screens.map((screen) => (
+                  <SelectItem key={screen.id} value={screen.id}>
+                    {screen.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button onClick={confirmSharing} disabled={!selectedScreen} className="w-full">
+              Confirm and Start Sharing
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Debug information */}
+      <div className="fixed bottom-0 left-0 right-0 bg-black bg-opacity-75 text-white p-4 max-h-48 overflow-auto">
+        <h3 className="font-bold mb-2">Debug Info:</h3>
+        {debugInfo.map((msg, i) => (
+          <div key={i} className="text-sm">{msg}</div>
+        ))}
+      </div>
     </div>
-  )
+  );
 }
