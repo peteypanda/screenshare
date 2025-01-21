@@ -1,11 +1,19 @@
 {
   "$schema": "https://ui.shadcn.com/schema.json",
+<<<<<<< HEAD
   "style": "new-york",
+=======
+  "style": "default",
+>>>>>>> 389728c45cb159dfd821887a2888012f20d9a9bf
   "rsc": true,
   "tsx": true,
   "tailwind": {
     "config": "tailwind.config.ts",
+<<<<<<< HEAD
     "css": "src/app/globals.css",
+=======
+    "css": "app/globals.css",
+>>>>>>> 389728c45cb159dfd821887a2888012f20d9a9bf
     "baseColor": "neutral",
     "cssVariables": true,
     "prefix": ""
